@@ -23,8 +23,12 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from starlette.status import HTTP_403_FORBIDDEN
 
+# Keep pdfplumber/pdf2image imports in case you use them elsewhere in the project.
 import pdfplumber
 from pdf2image import convert_from_path
+# Imaging / OCR / PDF libs
+import fitz  # PyMuPDF
+import io
 import pytesseract
 import cv2
 import numpy as np
@@ -97,7 +101,9 @@ os.makedirs("uploads", exist_ok=True) # change if needed
 
 # ---------------- Gemini CONFIG ----------------
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini_model = genai.GenerativeModel("models/gemini-2.5-pro")
+gemini_model_name = os.getenv("GEMINI_MODEL")
+gemini_model = genai.GenerativeModel(model_name=gemini_model_name,
+                                     generation_config={"temperature": 0.0})
 
 # ---------------- Encoding ----------------
 encoding = tiktoken.encoding_for_model("gpt-4-32k")
@@ -123,9 +129,13 @@ def setup_logger():
 setup_logger()
 warnings.filterwarnings("ignore", message="CropBox missing")
 
+# ---------------- TESSERACT PATH ----------------
+# Adjust this if necessary for your environment
+#pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 # ---------------- HELPERS ----------------
-def hash_image(img) -> str:
-    import io
+def hash_image(img: Image.Image) -> str:
+    """Hash a PIL image (PNG bytes) for duplicate detection."""
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return hashlib.md5(buf.getvalue()).hexdigest()
@@ -180,112 +190,178 @@ def load_extracted_text(output_path: str) -> str:
             return f.read()
     return None
 
-# ---------------- IMAGE PREPROCESSING + HYBRID OCR ----------------
-def preprocess_image_for_ocr(pil_img):
-    """Enhance image for OCR using denoising and adaptive thresholding."""
-    img_cv = np.array(pil_img)
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    gray = cv2.fastNlMeansDenoising(gray, h=30)
-    thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 35, 11
-    )
+# ---------------- IMAGE PREPROCESSING + HYBRID OCR (fast) ----------------
+def preprocess_image_fast(pil_img: Image.Image) -> Image.Image:
+    """
+    Lightweight preprocessing: grayscale -> small Gaussian blur -> Otsu threshold.
+    Faster than heavy denoising + adaptive threshold for most scanned documents.
+    """
+    img = pil_img.convert("L")
+    arr = np.array(img)
+
+    # small Gaussian blur to remove tiny noise
+    arr = cv2.GaussianBlur(arr, (3, 3), 0)
+
+    # Otsu threshold (fast, robust)
+    _, thresh = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return Image.fromarray(thresh)
 
-def hybrid_ocr(pil_img):
+def fast_ocr(pil_img: Image.Image) -> str:
     """
-    Hybrid OCR using multiple PSM modes to handle mixed layouts:
-    - psm 4: multiple columns or text blocks
-    - psm 6: uniform block (tables/forms)
-    - psm 11: sparse text (scattered info)
+    Single fast Tesseract pass (PSM 6 recommended for blocks/forms).
+    Keep OEM 1 (LSTM) for best accuracy on modern Tesseract builds.
     """
-    configs = [
-        "--oem 1 --psm 4 -l eng",
-        "--oem 1 --psm 6 -l eng",
-        "--oem 1 --psm 11 -l eng"
-    ]
+    config = "--oem 1 --psm 6 -l eng"
+    return pytesseract.image_to_string(pil_img, config=config)
 
-    best_text = ""
-    for cfg in configs:
-        text = pytesseract.image_to_string(pil_img, config=cfg)
-        if len(text.strip()) > len(best_text):
-            best_text = text
-    return best_text
+
+# Keep a compatibility wrapper named hybrid_ocr (original code references it).
+def hybrid_ocr(pil_img: Image.Image) -> str:
+    # For speed, just call the fast_ocr single pass. If you want to experiment,
+    # you can later try multiple configs and pick best; that costs time.
+    return fast_ocr(pil_img)
+
+
+# ---------------- FAST PAGE RENDERING ----------------
+def render_page_fast(page, scale: float = 1.7) -> Image.Image:
+    """
+    Render a page using PyMuPDF matrix scaling, which is faster than repeatedly using DPI.
+    scale ~1.7 approximates ~150 DPI for most pages — adjust if you need higher fidelity.
+    """
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img_bytes = pix.tobytes("png")
+    return Image.open(io.BytesIO(img_bytes))
+
+
+# ---------------- SCANNED PAGE DETECTION (vectorized, fast) ----------------
+def is_scanned_page(page, thumb_scale: float = 0.25, white_threshold: int = 245, dark_ratio_threshold: float = 0.06) -> bool:
+    """
+    Fast detection if page is scanned (rasterized) by creating a tiny thumbnail and using vectorized numpy ops.
+
+    - thumb_scale: small scale factor (0.25) to produce a tiny image (very fast)
+    - white_threshold: pixel value above which we consider a pixel "white"
+    - dark_ratio_threshold: fraction of non-white pixels above which we treat as scanned
+    """
+    try:
+        # small matrix for thumbnail
+        mat = fitz.Matrix(thumb_scale, thumb_scale)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+        arr = np.array(img)
+
+        # vectorized: proportion of pixels darker than white_threshold
+        dark_pixels = np.count_nonzero(arr < white_threshold)
+        total = arr.size
+        dark_ratio = dark_pixels / total
+
+        # If the thumbnail has a reasonable amount of dark pixels -> likely contains raster content
+        return dark_ratio > dark_ratio_threshold
+    except Exception as e:
+        logger.debug(f"is_scanned_page detection failed: {e}")
+        return False
 
 # ---------------- REGEX EXTRACTION ----------------
 def extract_with_regex(text, data_points):
     results = {}
-    for key, pattern in data_points.items():
-        try:
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-            results[key] = match.group(1).strip() if match else None
-        except Exception:
-            results[key] = None
+    compiled_patterns = {k: re.compile(p, re.IGNORECASE | re.DOTALL) for k, p in data_points.items()}
+    for key, pattern in compiled_patterns.items():
+        match = pattern.search(text)
+        results[key] = match.group(1).strip() if match else None
     return results
 
-# ---------------- PDF TEXT EXTRACTION ----------------
+# ---------------- PDF TEXT EXTRACTION (OPTIMIZED) ----------------
 def text_extract_from_pdf(pdf_path: str) -> str:
     page_texts: Dict[int, str] = {}
     seen_image_hashes = set()
 
-    tess_cmd = os.getenv("TESSERACT_CMD")
-    if tess_cmd:
-        pytesseract.pytesseract.tesseract_cmd = tess_cmd
-    elif platform.system() == "Windows":
-        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in tqdm(pdf.pages, desc="Extracting All Signals"):
-                page_num = page.page_number
-                segments = [f"[PAGE {page_num} START]"]
+        doc = fitz.open(pdf_path)
 
-                # Digital text
-                raw_text = page.extract_text(x_tolerance=0.5, y_tolerance=1.5, layout=True)
-                if raw_text:
-                    text_lines = [clean_text_for_llm(line) for line in raw_text.splitlines() if line.strip()]
-                    if text_lines:
-                        segments.append("[TEXT] " + " ".join(text_lines))
+        for page_idx in tqdm(range(len(doc)), desc="Extracting All Signals"):
+            page = doc[page_idx]
+            page_num = page_idx + 1
 
-                # Tables
-                tables = page.extract_tables()
+            segments = [f"[PAGE {page_num} START]"]
+
+            # ---------------- Digital Text ----------------
+            raw_text = page.get_text("text") or ""
+            raw_text_clean = raw_text.strip()
+
+            if raw_text_clean:
+                text_lines = [clean_text_for_llm(line) for line in raw_text_clean.splitlines() if line.strip()]
+                if text_lines:
+                    segments.append("[TEXT] " + " ".join(text_lines))
+
+            # ---------------- Tables (PyMuPDF) ----------------
+            try:
+                tables = page.find_tables()
                 if tables:
                     for t_idx, table in enumerate(tables, start=1):
                         segments.append(f"[TABLE {t_idx}]")
-                        for r_idx, row in enumerate(table, start=1):
-                            if any(cell and cell.strip() for cell in row):
-                                row_text = " | ".join([clean_text_for_llm(cell) if cell else "" for cell in row])
-                                segments.append(f"  [ROW {r_idx}] {row_text}")
+                        df = table.to_pandas()
+                        for r_idx, row in df.iterrows():
+                            row_text = " | ".join(clean_text_for_llm(str(v)) if v else "" for v in row.values)
+                            segments.append(f"  [ROW {r_idx+1}] {row_text}")
+            except Exception:
+                # table extraction is optional; ignore failures
+                pass
 
-                # OCR for images (Hybrid)
-                if page.images:
-                    img = convert_from_path(pdf_path, dpi=300, first_page=page_num, last_page=page_num)[0]
-                    img_hash = hash_image(img)
-                    if img_hash not in seen_image_hashes:
-                        seen_image_hashes.add(img_hash)
+            # ---------------- Scanned Page Detection (fast) ----------------
+            # Decide if we need OCR:
+            # - If no digital text -> likely scanned OR
+            # - If thumbnail analysis suggests raster content -> likely scanned
+            scanned = False
+            if not raw_text_clean:
+                scanned = True
+            else:
+                # If text exists but small, or thumbnail shows raster content, run OCR
+                if len(raw_text_clean) < 30:
+                    scanned = True
+                else:
+                    # thumbnail test (fast)
+                    try:
+                        if is_scanned_page(page):
+                            scanned = True
+                    except Exception as e:
+                        logger.debug(f"Thumbnail detection error on page {page_num}: {e}")
+                        scanned = False
 
-                        processed_img = preprocess_image_for_ocr(img)
-                        ocr_raw = hybrid_ocr(processed_img)
+            # ---------------- OCR for Scanned Pages ----------------
+            if scanned:
+                # Fast render (matrix scaling) -> high enough resolution for accurate OCR
+                img = render_page_fast(page, scale=1.7)
 
-                        if ocr_raw.strip():
-                            ocr_lines = [clean_text_for_llm(line) for line in ocr_raw.splitlines() if line.strip()]
-                            if ocr_lines:
-                                if "|" in ocr_raw or re.search(r"\s{3,}", ocr_raw):
-                                    segments.append("[OCR_TABLE] " + " ".join(ocr_lines))
-                                else:
-                                    segments.append("[OCR] " + " ".join(ocr_lines))
-                    else:
-                        logger.info(f"OCR skipped for page {page_num} (duplicate image)")
+                img_hash = hash_image(img)
 
-                segments.append(f"[PAGE {page_num} END]")
-                # Remove duplicates and store
-                segments = list(OrderedDict.fromkeys(segments))
-                page_texts[page_num] = "\n".join(segments)
+                if img_hash not in seen_image_hashes:
+                    seen_image_hashes.add(img_hash)
+
+                    processed_img = preprocess_image_fast(img)
+                    ocr_raw = hybrid_ocr(processed_img)
+
+                    if ocr_raw and ocr_raw.strip():
+                        ocr_lines = [clean_text_for_llm(line) for line in ocr_raw.splitlines() if line.strip()]
+                        if ocr_lines:
+                            if "|" in ocr_raw or re.search(r"\s{3,}", ocr_raw):
+                                segments.append("[OCR_TABLE] " + " ".join(ocr_lines))
+                            else:
+                                segments.append("[OCR] " + " ".join(ocr_lines))
+                else:
+                    logger.info(f"OCR skipped for page {page_num} (duplicate image)")
+
+            segments.append(f"[PAGE {page_num} END]")
+
+            # Remove duplicates and store
+            segments = list(OrderedDict.fromkeys(segments))
+            page_texts[page_num] = "\n".join(segments)
 
     except Exception as e:
-        logger.error(f"Failed to process {pdf_path}: {e}")
+        logger.error(f" Failed to process {pdf_path}: {e}", exc_info=True)
         raise
 
+    # Return all pages in order
     return "\n".join(page_texts[p] for p in sorted(page_texts.keys()))
 
 # ---------------- MAIN PROCESS ----------------
@@ -306,7 +382,7 @@ def main(file_path, business, data_points_map, prompt_map):
         max_tokens = 4000
         if business == "package":
             max_tokens = 5000
-        texts = split_text(large_text,max_tokens,buffer=400)
+        texts = split_text(large_text, max_tokens, buffer=400)
         vectorstore = create_vectorstore(texts)
         retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
         docs = retriever.get_relevant_documents("insurance policy document")
@@ -326,26 +402,28 @@ def main(file_path, business, data_points_map, prompt_map):
         prompt_token_count = len(encoding.encode(prompt_text))
         logger.info(f"Sending {prompt_token_count} tokens to Gemini for fallback extraction")
 
-        if business in ["cyber","general_liability","comercial_auto"]:
-            gemini_flash_model = genai.GenerativeModel("models/gemini-2.5-flash")
-            logger.info(f"Extracting using Gemini 2.5-flash for {business} business")
-            response = gemini_flash_model.generate_content(
-                ["JSON only", prompt_text],
-                generation_config={"response_mime_type": "application/json"}
-            )
-        else:
-            response = gemini_model.generate_content(
-            ["JSON only", prompt_text],
-            generation_config={
-                "response_mime_type": "application/json",
-            })
-            logger.info(f"Extracting using {gemini_model} for {business} business")
         try:
+            if business in ["cyber", "general_liability", "comercial_auto"]:
+                gemini_flash_model = genai.GenerativeModel(model_name=gemini_model_name,
+                                                          generation_config={"temperature": 0.0})
+                logger.info(f"Extracting using {gemini_model_name} for {business} business")
+                response = gemini_flash_model.generate_content(
+                    ["JSON only", prompt_text],
+                    generation_config={"response_mime_type": "application/json"}
+                )
+            else:
+                response = gemini_model.generate_content(
+                    ["JSON only", prompt_text],
+                    generation_config={
+                        "response_mime_type": "application/json",
+                    })
+                logger.info(f"Extracting using {gemini_model} for {business} business")
+
             gemini_data = json.loads(response.text.replace("```json", '').replace("```", ''))
             for k in missing_keys:
                 regex_results[k] = gemini_data.get(k, None)
         except Exception as e:
-            logger.error(f"Gemini fallback failed: {e}")
+            logger.error(f"Gemini fallback failed: {e}", exc_info=True)
 
     return normalize_dict_keys(regex_results)
 
@@ -416,3 +494,4 @@ if __name__ == "__main__":
             save_dict_to_json(result, file_path)
         except Exception as e:
             logger.error(f"Failed {file_path}: {e}", exc_info=True)
+        break
